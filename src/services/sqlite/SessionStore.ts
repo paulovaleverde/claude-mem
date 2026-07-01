@@ -1689,6 +1689,67 @@ export class SessionStore {
    * Assumes session already exists (created by hook)
    * Performs content-hash deduplication: skips INSERT if an identical observation exists within 30s
    */
+  /**
+   * Single write choke-point for the `observations` table.
+   *
+   * All live observation writers (storeObservation, storeObservations,
+   * importObservation) route their INSERT through here so there is exactly ONE
+   * place a row enters `observations`. Deduplication stays in each caller (their
+   * rules differ: content-hash window vs title+epoch), so this method performs
+   * only the raw row insert and returns the new row id.
+   *
+   * NOTE: no content filtering/refusal happens here yet — that guard is Item 2.
+   */
+  private insertObservationRow(row: {
+    memory_session_id: string;
+    project: string;
+    text: string | null;
+    type: string;
+    title: string | null;
+    subtitle: string | null;
+    facts: string | null;
+    narrative: string | null;
+    concepts: string | null;
+    files_read: string | null;
+    files_modified: string | null;
+    prompt_number: number | null;
+    discovery_tokens: number;
+    content_hash: string | null;
+    created_at: string;
+    created_at_epoch: number;
+    generated_by_model: string | null;
+  }): number {
+    const stmt = this.db.prepare(`
+      INSERT INTO observations
+      (memory_session_id, project, text, type, title, subtitle, facts, narrative, concepts,
+       files_read, files_modified, prompt_number, discovery_tokens, content_hash,
+       created_at, created_at_epoch, generated_by_model)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const result = stmt.run(
+      row.memory_session_id,
+      row.project,
+      row.text,
+      row.type,
+      row.title,
+      row.subtitle,
+      row.facts,
+      row.narrative,
+      row.concepts,
+      row.files_read,
+      row.files_modified,
+      row.prompt_number,
+      row.discovery_tokens,
+      row.content_hash,
+      row.created_at,
+      row.created_at_epoch,
+      row.generated_by_model
+    );
+
+    return Number(result.lastInsertRowid);
+  }
+
   storeObservation(
     memorySessionId: string,
     project: string,
@@ -1718,35 +1779,28 @@ export class SessionStore {
       return { id: existing.id, createdAtEpoch: existing.created_at_epoch };
     }
 
-    const stmt = this.db.prepare(`
-      INSERT INTO observations
-      (memory_session_id, project, type, title, subtitle, facts, narrative, concepts,
-       files_read, files_modified, prompt_number, discovery_tokens, content_hash, created_at, created_at_epoch,
-       generated_by_model)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    const result = stmt.run(
-      memorySessionId,
+    const id = this.insertObservationRow({
+      memory_session_id: memorySessionId,
       project,
-      observation.type,
-      observation.title,
-      observation.subtitle,
-      JSON.stringify(observation.facts),
-      observation.narrative,
-      JSON.stringify(observation.concepts),
-      JSON.stringify(observation.files_read),
-      JSON.stringify(observation.files_modified),
-      promptNumber || null,
-      discoveryTokens,
-      contentHash,
-      timestampIso,
-      timestampEpoch,
-      generatedByModel || null
-    );
+      text: null,
+      type: observation.type,
+      title: observation.title,
+      subtitle: observation.subtitle,
+      facts: JSON.stringify(observation.facts),
+      narrative: observation.narrative,
+      concepts: JSON.stringify(observation.concepts),
+      files_read: JSON.stringify(observation.files_read),
+      files_modified: JSON.stringify(observation.files_modified),
+      prompt_number: promptNumber || null,
+      discovery_tokens: discoveryTokens,
+      content_hash: contentHash,
+      created_at: timestampIso,
+      created_at_epoch: timestampEpoch,
+      generated_by_model: generatedByModel || null,
+    });
 
     return {
-      id: Number(result.lastInsertRowid),
+      id,
       createdAtEpoch: timestampEpoch
     };
   }
@@ -1853,14 +1907,6 @@ export class SessionStore {
       const observationIds: number[] = [];
 
       // 1. Store all observations (with content-hash deduplication)
-      const obsStmt = this.db.prepare(`
-        INSERT INTO observations
-        (memory_session_id, project, type, title, subtitle, facts, narrative, concepts,
-         files_read, files_modified, prompt_number, discovery_tokens, content_hash, created_at, created_at_epoch,
-         generated_by_model)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-
       for (const observation of observations) {
         // Content-hash deduplication (same logic as storeObservation singular)
         const contentHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative);
@@ -1870,25 +1916,26 @@ export class SessionStore {
           continue;
         }
 
-        const result = obsStmt.run(
-          memorySessionId,
+        const id = this.insertObservationRow({
+          memory_session_id: memorySessionId,
           project,
-          observation.type,
-          observation.title,
-          observation.subtitle,
-          JSON.stringify(observation.facts),
-          observation.narrative,
-          JSON.stringify(observation.concepts),
-          JSON.stringify(observation.files_read),
-          JSON.stringify(observation.files_modified),
-          promptNumber || null,
-          discoveryTokens,
-          contentHash,
-          timestampIso,
-          timestampEpoch,
-          generatedByModel || null
-        );
-        observationIds.push(Number(result.lastInsertRowid));
+          text: null,
+          type: observation.type,
+          title: observation.title,
+          subtitle: observation.subtitle,
+          facts: JSON.stringify(observation.facts),
+          narrative: observation.narrative,
+          concepts: JSON.stringify(observation.concepts),
+          files_read: JSON.stringify(observation.files_read),
+          files_modified: JSON.stringify(observation.files_modified),
+          prompt_number: promptNumber || null,
+          discovery_tokens: discoveryTokens,
+          content_hash: contentHash,
+          created_at: timestampIso,
+          created_at_epoch: timestampEpoch,
+          generated_by_model: generatedByModel || null,
+        });
+        observationIds.push(id);
       }
 
       // 2. Store summary if provided
@@ -2586,33 +2633,27 @@ export class SessionStore {
       return { imported: false, id: existing.id };
     }
 
-    const stmt = this.db.prepare(`
-      INSERT INTO observations (
-        memory_session_id, project, text, type, title, subtitle,
-        facts, narrative, concepts, files_read, files_modified,
-        prompt_number, discovery_tokens, created_at, created_at_epoch
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+    const id = this.insertObservationRow({
+      memory_session_id: obs.memory_session_id,
+      project: obs.project,
+      text: obs.text,
+      type: obs.type,
+      title: obs.title,
+      subtitle: obs.subtitle,
+      facts: obs.facts,
+      narrative: obs.narrative,
+      concepts: obs.concepts,
+      files_read: obs.files_read,
+      files_modified: obs.files_modified,
+      prompt_number: obs.prompt_number,
+      discovery_tokens: obs.discovery_tokens || 0,
+      content_hash: null,
+      created_at: obs.created_at,
+      created_at_epoch: obs.created_at_epoch,
+      generated_by_model: null,
+    });
 
-    const result = stmt.run(
-      obs.memory_session_id,
-      obs.project,
-      obs.text,
-      obs.type,
-      obs.title,
-      obs.subtitle,
-      obs.facts,
-      obs.narrative,
-      obs.concepts,
-      obs.files_read,
-      obs.files_modified,
-      obs.prompt_number,
-      obs.discovery_tokens || 0,
-      obs.created_at,
-      obs.created_at_epoch
-    );
-
-    return { imported: true, id: result.lastInsertRowid as number };
+    return { imported: true, id };
   }
 
   /**
